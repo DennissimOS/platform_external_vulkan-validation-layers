@@ -46,6 +46,7 @@
 #include "vk_enum_string_helper.h"
 #include "vk_validation_error_messages.h"
 #include "vk_object_types.h"
+#include "vk_extension_helper.h"
 #include "vulkan/vk_layer.h"
 
 // This intentionally includes a cpp file
@@ -67,11 +68,11 @@ static void InstanceExtensionWhitelist(const VkInstanceCreateInfo *pCreateInfo, 
 
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         // Check for recognized instance extensions
-        if (!white_list(pCreateInfo->ppEnabledExtensionNames[i], kUniqueObjectsSupportedInstanceExtensions)) {
+        if (!white_list(pCreateInfo->ppEnabledExtensionNames[i], kInstanceExtensionNames)) {
             log_msg(instance_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT, 0, __LINE__,
                     VALIDATION_ERROR_UNDEFINED, "UniqueObjects",
-                    "Instance Extension %s is not supported by this layer.  Using this extension may adversely affect "
-                    "validation results and/or produce undefined behavior.",
+                    "Instance Extension %s is not supported by this layer.  Using this extension may adversely affect validation "
+                    "results and/or produce undefined behavior.",
                     pCreateInfo->ppEnabledExtensionNames[i]);
         }
     }
@@ -83,11 +84,11 @@ static void DeviceExtensionWhitelist(const VkDeviceCreateInfo *pCreateInfo, VkDe
 
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
         // Check for recognized device extensions
-        if (!white_list(pCreateInfo->ppEnabledExtensionNames[i], kUniqueObjectsSupportedDeviceExtensions)) {
+        if (!white_list(pCreateInfo->ppEnabledExtensionNames[i], kDeviceExtensionNames)) {
             log_msg(device_data->report_data, VK_DEBUG_REPORT_ERROR_BIT_EXT, VK_DEBUG_REPORT_OBJECT_TYPE_UNKNOWN_EXT, 0, __LINE__,
                     VALIDATION_ERROR_UNDEFINED, "UniqueObjects",
-                    "Device Extension %s is not supported by this layer.  Using this extension may adversely affect "
-                    "validation results and/or produce undefined behavior.",
+                    "Device Extension %s is not supported by this layer.  Using this extension may adversely affect validation "
+                    "results and/or produce undefined behavior.",
                     pCreateInfo->ppEnabledExtensionNames[i]);
         }
     }
@@ -117,9 +118,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *pCreat
     layer_init_instance_dispatch_table(*pInstance, &instance_data->dispatch_table, fpGetInstanceProcAddr);
 
     instance_data->instance = *pInstance;
-    instance_data->report_data =
-        debug_report_create_instance(&instance_data->dispatch_table, *pInstance, pCreateInfo->enabledExtensionCount,
-                                     pCreateInfo->ppEnabledExtensionNames);
+    instance_data->report_data = debug_report_create_instance(
+        &instance_data->dispatch_table, *pInstance, pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
 
     // Set up temporary debug callbacks to output messages at CreateInstance-time
     if (!layer_copy_tmp_callbacks(pCreateInfo->pNext, &instance_data->num_tmp_callbacks, &instance_data->tmp_dbg_create_infos,
@@ -269,7 +269,6 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance
     return table.GetInstanceProcAddr(instance, funcName);
 }
 
-
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetPhysicalDeviceProcAddr(VkInstance instance, const char *funcName) {
     instance_layer_data *instance_data = GetLayerDataPtr(get_dispatch_key(instance), instance_layer_data_map);
     VkLayerInstanceDispatchTable *disp_table = &instance_data->dispatch_table;
@@ -305,8 +304,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateComputePipelines(VkDevice device, VkPipelin
         pipelineCache = Unwrap(device_data, pipelineCache);
     }
 
-    VkResult result = device_data->dispatch_table.CreateComputePipelines(
-        device, pipelineCache, createInfoCount, local_pCreateInfos->ptr(), pAllocator, pPipelines);
+    VkResult result = device_data->dispatch_table.CreateComputePipelines(device, pipelineCache, createInfoCount,
+                                                                         local_pCreateInfos->ptr(), pAllocator, pPipelines);
     delete[] local_pCreateInfos;
     {
         std::lock_guard<std::mutex> lock(global_lock);
@@ -328,7 +327,22 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipeli
         local_pCreateInfos = new safe_VkGraphicsPipelineCreateInfo[createInfoCount];
         std::lock_guard<std::mutex> lock(global_lock);
         for (uint32_t idx0 = 0; idx0 < createInfoCount; ++idx0) {
-            local_pCreateInfos[idx0].initialize(&pCreateInfos[idx0]);
+            bool uses_color_attachment = false;
+            bool uses_depthstencil_attachment = false;
+            {
+                const auto subpasses_uses_it =
+                    device_data->renderpasses_states.find(Unwrap(device_data, pCreateInfos[idx0].renderPass));
+                if (subpasses_uses_it != device_data->renderpasses_states.end()) {
+                    const auto &subpasses_uses = subpasses_uses_it->second;
+                    if (subpasses_uses.subpasses_using_color_attachment.count(pCreateInfos[idx0].subpass))
+                        uses_color_attachment = true;
+                    if (subpasses_uses.subpasses_using_depthstencil_attachment.count(pCreateInfos[idx0].subpass))
+                        uses_depthstencil_attachment = true;
+                }
+            }
+
+            local_pCreateInfos[idx0].initialize(&pCreateInfos[idx0], uses_color_attachment, uses_depthstencil_attachment);
+
             if (pCreateInfos[idx0].basePipelineHandle) {
                 local_pCreateInfos[idx0].basePipelineHandle = Unwrap(device_data, pCreateInfos[idx0].basePipelineHandle);
             }
@@ -338,7 +352,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipeli
             if (pCreateInfos[idx0].pStages) {
                 for (uint32_t idx1 = 0; idx1 < pCreateInfos[idx0].stageCount; ++idx1) {
                     if (pCreateInfos[idx0].pStages[idx1].module) {
-                        local_pCreateInfos[idx0].pStages[idx1].module = Unwrap(device_data, pCreateInfos[idx0].pStages[idx1].module);
+                        local_pCreateInfos[idx0].pStages[idx1].module =
+                            Unwrap(device_data, pCreateInfos[idx0].pStages[idx1].module);
                     }
                 }
             }
@@ -352,8 +367,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipeli
         pipelineCache = Unwrap(device_data, pipelineCache);
     }
 
-    VkResult result = device_data->dispatch_table.CreateGraphicsPipelines(
-        device, pipelineCache, createInfoCount, local_pCreateInfos->ptr(), pAllocator, pPipelines);
+    VkResult result = device_data->dispatch_table.CreateGraphicsPipelines(device, pipelineCache, createInfoCount,
+                                                                          local_pCreateInfos->ptr(), pAllocator, pPipelines);
     delete[] local_pCreateInfos;
     {
         std::lock_guard<std::mutex> lock(global_lock);
@@ -364,6 +379,55 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipeli
         }
     }
     return result;
+}
+
+static void PostCallCreateRenderPass(layer_data *dev_data, const VkRenderPassCreateInfo *pCreateInfo, VkRenderPass renderPass) {
+    auto &renderpass_state = dev_data->renderpasses_states[renderPass];
+
+    for (uint32_t subpass = 0; subpass < pCreateInfo->subpassCount; ++subpass) {
+        bool uses_color = false;
+        for (uint32_t i = 0; i < pCreateInfo->pSubpasses[subpass].colorAttachmentCount && !uses_color; ++i)
+            if (pCreateInfo->pSubpasses[subpass].pColorAttachments[i].attachment != VK_ATTACHMENT_UNUSED) uses_color = true;
+
+        bool uses_depthstencil = false;
+        if (pCreateInfo->pSubpasses[subpass].pDepthStencilAttachment)
+            if (pCreateInfo->pSubpasses[subpass].pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED)
+                uses_depthstencil = true;
+
+        if (uses_color) renderpass_state.subpasses_using_color_attachment.insert(subpass);
+        if (uses_depthstencil) renderpass_state.subpasses_using_depthstencil_attachment.insert(subpass);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *pCreateInfo,
+                                                const VkAllocationCallbacks *pAllocator, VkRenderPass *pRenderPass) {
+    layer_data *dev_data = GetLayerDataPtr(get_dispatch_key(device), layer_data_map);
+    VkResult result = dev_data->dispatch_table.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
+    if (VK_SUCCESS == result) {
+        std::lock_guard<std::mutex> lock(global_lock);
+
+        PostCallCreateRenderPass(dev_data, pCreateInfo, *pRenderPass);
+
+        *pRenderPass = WrapNew(dev_data, *pRenderPass);
+    }
+    return result;
+}
+
+static void PostCallDestroyRenderPass(layer_data *dev_data, VkRenderPass renderPass) {
+    dev_data->renderpasses_states.erase(renderPass);
+}
+
+VKAPI_ATTR void VKAPI_CALL DestroyRenderPass(VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks *pAllocator) {
+    layer_data *dev_data = GetLayerDataPtr(get_dispatch_key(device), layer_data_map);
+    std::unique_lock<std::mutex> lock(global_lock);
+    uint64_t renderPass_id = reinterpret_cast<uint64_t &>(renderPass);
+    renderPass = (VkRenderPass)dev_data->unique_id_mapping[renderPass_id];
+    dev_data->unique_id_mapping.erase(renderPass_id);
+    lock.unlock();
+    dev_data->dispatch_table.DestroyRenderPass(device, renderPass, pAllocator);
+
+    lock.lock();
+    PostCallDestroyRenderPass(dev_data, renderPass);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
@@ -378,8 +442,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapc
         local_pCreateInfo->surface = Unwrap(my_map_data->instance_data, pCreateInfo->surface);
     }
 
-    VkResult result = my_map_data->dispatch_table.CreateSwapchainKHR(
-        device, local_pCreateInfo->ptr(), pAllocator, pSwapchain);
+    VkResult result = my_map_data->dispatch_table.CreateSwapchainKHR(device, local_pCreateInfo->ptr(), pAllocator, pSwapchain);
     if (local_pCreateInfo) {
         delete local_pCreateInfo;
     }
@@ -411,8 +474,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSharedSwapchainsKHR(VkDevice device, uint32
             }
         }
     }
-    VkResult result = dev_data->dispatch_table.CreateSharedSwapchainsKHR(
-        device, swapchainCount, local_pCreateInfos->ptr(), pAllocator, pSwapchains);
+    VkResult result = dev_data->dispatch_table.CreateSharedSwapchainsKHR(device, swapchainCount, local_pCreateInfos->ptr(),
+                                                                         pAllocator, pSwapchains);
     if (local_pCreateInfos) delete[] local_pCreateInfos;
     if (VK_SUCCESS == result) {
         std::lock_guard<std::mutex> lock(global_lock);
@@ -495,8 +558,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDescriptorUpdateTemplateKHR(VkDevice device
             }
         }
     }
-    VkResult result = dev_data->dispatch_table.CreateDescriptorUpdateTemplateKHR(
-        device, local_create_info->ptr(), pAllocator, pDescriptorUpdateTemplate);
+    VkResult result = dev_data->dispatch_table.CreateDescriptorUpdateTemplateKHR(device, local_create_info->ptr(), pAllocator,
+                                                                                 pDescriptorUpdateTemplate);
     if (VK_SUCCESS == result) {
         std::lock_guard<std::mutex> lock(global_lock);
         *pDescriptorUpdateTemplate = WrapNew(dev_data, *pDescriptorUpdateTemplate);
@@ -608,14 +671,14 @@ VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSetWithTemplateKHR(VkDevice device, V
                                                               const void *pData) {
     layer_data *dev_data = GetLayerDataPtr(get_dispatch_key(device), layer_data_map);
     uint64_t template_handle = reinterpret_cast<uint64_t &>(descriptorUpdateTemplate);
+    void *unwrapped_buffer = nullptr;
     {
         std::lock_guard<std::mutex> lock(global_lock);
         descriptorSet = Unwrap(dev_data, descriptorSet);
         descriptorUpdateTemplate = (VkDescriptorUpdateTemplateKHR)dev_data->unique_id_mapping[template_handle];
+        unwrapped_buffer = BuildUnwrappedUpdateTemplateBuffer(dev_data, template_handle, pData);
     }
-    void *unwrapped_buffer = BuildUnwrappedUpdateTemplateBuffer(dev_data, template_handle, pData);
-    dev_data->dispatch_table.UpdateDescriptorSetWithTemplateKHR(device, descriptorSet, descriptorUpdateTemplate,
-                                                                        unwrapped_buffer);
+    dev_data->dispatch_table.UpdateDescriptorSetWithTemplateKHR(device, descriptorSet, descriptorUpdateTemplate, unwrapped_buffer);
     free(unwrapped_buffer);
 }
 
@@ -624,14 +687,15 @@ VKAPI_ATTR void VKAPI_CALL CmdPushDescriptorSetWithTemplateKHR(VkCommandBuffer c
                                                                VkPipelineLayout layout, uint32_t set, const void *pData) {
     layer_data *dev_data = GetLayerDataPtr(get_dispatch_key(commandBuffer), layer_data_map);
     uint64_t template_handle = reinterpret_cast<uint64_t &>(descriptorUpdateTemplate);
+    void *unwrapped_buffer = nullptr;
     {
         std::lock_guard<std::mutex> lock(global_lock);
         descriptorUpdateTemplate = Unwrap(dev_data, descriptorUpdateTemplate);
         layout = Unwrap(dev_data, layout);
+        unwrapped_buffer = BuildUnwrappedUpdateTemplateBuffer(dev_data, template_handle, pData);
     }
-    void *unwrapped_buffer = BuildUnwrappedUpdateTemplateBuffer(dev_data, template_handle, pData);
     dev_data->dispatch_table.CmdPushDescriptorSetWithTemplateKHR(commandBuffer, descriptorUpdateTemplate, layout, set,
-                                                                         unwrapped_buffer);
+                                                                 unwrapped_buffer);
     free(unwrapped_buffer);
 }
 
@@ -640,8 +704,8 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceDisplayPropertiesKHR(VkPhysicalD
                                                                      VkDisplayPropertiesKHR *pProperties) {
     instance_layer_data *my_map_data = GetLayerDataPtr(get_dispatch_key(physicalDevice), instance_layer_data_map);
 
-    VkResult result = my_map_data->dispatch_table.GetPhysicalDeviceDisplayPropertiesKHR(
-        physicalDevice, pPropertyCount, pProperties);
+    VkResult result =
+        my_map_data->dispatch_table.GetPhysicalDeviceDisplayPropertiesKHR(physicalDevice, pPropertyCount, pProperties);
     if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && pProperties) {
         std::lock_guard<std::mutex> lock(global_lock);
         for (uint32_t idx0 = 0; idx0 < *pPropertyCount; ++idx0) {
@@ -654,8 +718,8 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceDisplayPropertiesKHR(VkPhysicalD
 VKAPI_ATTR VkResult VKAPI_CALL GetDisplayPlaneSupportedDisplaysKHR(VkPhysicalDevice physicalDevice, uint32_t planeIndex,
                                                                    uint32_t *pDisplayCount, VkDisplayKHR *pDisplays) {
     instance_layer_data *my_map_data = GetLayerDataPtr(get_dispatch_key(physicalDevice), instance_layer_data_map);
-    VkResult result = my_map_data->dispatch_table.GetDisplayPlaneSupportedDisplaysKHR(physicalDevice, planeIndex,
-                                                                                                pDisplayCount, pDisplays);
+    VkResult result =
+        my_map_data->dispatch_table.GetDisplayPlaneSupportedDisplaysKHR(physicalDevice, planeIndex, pDisplayCount, pDisplays);
     if (VK_SUCCESS == result) {
         if ((*pDisplayCount > 0) && pDisplays) {
             std::lock_guard<std::mutex> lock(global_lock);
@@ -678,8 +742,7 @@ VKAPI_ATTR VkResult VKAPI_CALL GetDisplayModePropertiesKHR(VkPhysicalDevice phys
         display = Unwrap(my_map_data, display);
     }
 
-    VkResult result = my_map_data->dispatch_table.GetDisplayModePropertiesKHR(
-        physicalDevice, display, pPropertyCount, pProperties);
+    VkResult result = my_map_data->dispatch_table.GetDisplayModePropertiesKHR(physicalDevice, display, pPropertyCount, pProperties);
     if (result == VK_SUCCESS && pProperties) {
         std::lock_guard<std::mutex> lock(global_lock);
         for (uint32_t idx0 = 0; idx0 < *pPropertyCount; ++idx0) {
@@ -696,8 +759,7 @@ VKAPI_ATTR VkResult VKAPI_CALL GetDisplayPlaneCapabilitiesKHR(VkPhysicalDevice p
         std::lock_guard<std::mutex> lock(global_lock);
         mode = Unwrap(dev_data, mode);
     }
-    VkResult result =
-        dev_data->dispatch_table.GetDisplayPlaneCapabilitiesKHR(physicalDevice, mode, planeIndex, pCapabilities);
+    VkResult result = dev_data->dispatch_table.GetDisplayPlaneCapabilitiesKHR(physicalDevice, mode, planeIndex, pCapabilities);
     return result;
 }
 #endif
