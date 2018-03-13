@@ -21,6 +21,9 @@
 
 #include "vulkan/vulkan.h"
 
+#include <unordered_map>
+#include <unordered_set>
+
 #include "vk_layer_data.h"
 #include "vk_safe_struct.h"
 #include "vk_layer_utils.h"
@@ -69,6 +72,13 @@ struct layer_data {
     std::unordered_map<uint64_t, uint64_t> unique_id_mapping;  // Map uniqueID to actual object handle
     VkPhysicalDevice gpu;
 
+    struct SubpassesUsageStates {
+        std::unordered_set<uint32_t> subpasses_using_color_attachment;
+        std::unordered_set<uint32_t> subpasses_using_depthstencil_attachment;
+    };
+    // uses unwrapped handles
+    std::unordered_map<VkRenderPass, SubpassesUsageStates> renderpasses_states;
+
     layer_data() : wsi_enabled(false), gpu(VK_NULL_HANDLE){};
 };
 
@@ -99,10 +109,9 @@ bool ContainsExtStruct(const T *target, VkStructureType ext_type) {
     return false;
 }
 
-
 /* Unwrap a handle. */
 // must hold lock!
-template<typename HandleType, typename MapType>
+template <typename HandleType, typename MapType>
 HandleType Unwrap(MapType *layer_data, HandleType wrappedHandle) {
     // TODO: don't use operator[] here.
     return (HandleType)layer_data->unique_id_mapping[reinterpret_cast<uint64_t const &>(wrappedHandle)];
@@ -110,7 +119,7 @@ HandleType Unwrap(MapType *layer_data, HandleType wrappedHandle) {
 
 /* Wrap a newly created handle with a new unique ID, and return the new ID. */
 // must hold lock!
-template<typename HandleType, typename MapType>
+template <typename HandleType, typename MapType>
 HandleType WrapNew(MapType *layer_data, HandleType newlyCreatedHandle) {
     auto unique_id = global_unique_id++;
     layer_data->unique_id_mapping[unique_id] = reinterpret_cast<uint64_t const &>(newlyCreatedHandle);
